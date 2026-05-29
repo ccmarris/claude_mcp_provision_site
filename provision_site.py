@@ -596,6 +596,7 @@ class SiteProvisioner:
         self.cfg = cfg
         self._space_id: str = ''
         self._view_id: str = ''
+        self._zone_id: str = ''
 
     # ------------------------------------------------------------------
     # Step 1: Resolve IP space
@@ -815,23 +816,54 @@ class SiteProvisioner:
 
     def create_dns_zone(self) -> dict:
         '''
-        Create a forward authoritative DNS zone for the site under
-        the configured parent zone and DNS view.
+        Ensure the forward authoritative DNS zone exists for the site.
+
+        Checks whether the zone already exists in the configured view
+        before attempting to create it, so the script is safe to re-run
+        and will not fail on duplicate-zone errors.
 
         Zone name: site-<site>.<dns_parent>
 
         Returns:
-            Created DNS zone resource dict (or dry-run plan dict)
+            DNS zone resource dict (existing or newly created), or a
+            dry-run plan dict.  Always stores the zone ID in
+            self._zone_id for use by provision_hosts().
+
+        Raises:
+            SystemExit if zone creation fails for any reason other than
+            the zone already existing.
         '''
         fqdn = self.cfg.dns_zone
         logger.info(
-            '%sCreating DNS zone: %s  view=%s',
+            '%sEnsuring DNS zone exists: %s  view=%s',
             '[DRY-RUN] ' if self.cfg.dry_run else '',
             fqdn, self.cfg.dns_view,
         )
+
         if self.cfg.dry_run:
             return {'dry_run': True, 'fqdn': fqdn, 'view': self.cfg.dns_view}
 
+        # Check whether the zone already exists in this view
+        existing = self.client.get(
+            '/dns/auth_zone',
+            params={
+                '_filter': (
+                    f'fqdn=="{fqdn}." and '
+                    f'view=="{self._view_id}"'
+                ),
+            },
+        )
+        results = existing.get('results', [])
+        if results:
+            zone = results[0]
+            logger.info(
+                '  Zone already exists: %s  id=%s — skipping creation',
+                fqdn, zone.get('id'),
+            )
+            self._zone_id = zone['id']
+            return zone
+
+        # Zone does not exist — create it
         body = {
             'fqdn':         fqdn,
             'view':         self._view_id,
@@ -839,7 +871,8 @@ class SiteProvisioner:
         }
         result = self.client.post('/dns/auth_zone', body)
         zone = result.get('result', {})
-        logger.info('  Created zone id=%s', zone.get('id'))
+        self._zone_id = zone['id']
+        logger.info('  Created zone id=%s', self._zone_id)
         return zone
 
     # ------------------------------------------------------------------
@@ -914,7 +947,7 @@ class SiteProvisioner:
                     'enable_dhcp': False,
                 }],
                 'auto_generate_records': True,
-                'dns_zone': self._view_id,
+                'dns_zone': self._zone_id,   # zone ID, not view ID
             }
             result = self.client.post('/ipam/host', body)
             host = result.get('result', {})
