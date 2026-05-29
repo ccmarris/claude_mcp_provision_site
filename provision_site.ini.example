@@ -1,0 +1,28 @@
+# provision_site.ini
+# Configuration file for provision_site.py
+# Copy this file and fill in your values.
+# Keep this file secure — it contains your API key.
+
+[UDDI]
+# Your Infoblox BloxOne / Universal DDI API key
+api_key = <your-api-key-here>
+
+# Base URL for the CSP portal
+url     = https://csp.infoblox.com
+
+[DEFAULTS]
+# Name of the IP space that holds your address blocks
+ip_space    = marrison-ip-space
+
+# Parent DNS zone under which site zones are created
+# Site zones will be: site-<name>.<dns_parent>
+dns_parent  = marrison.internal
+
+# DNS view to use for zone and host record creation
+dns_view    = marrison-b1se-lab1
+
+# Tag value applied to all resources created by this script
+owner       = marrison
+
+# CIDR prefix length for carved subnets (e.g. 24 = /24)
+subnet_size = 24
