@@ -1,6 +1,6 @@
-# provision_site.py
+# provision_site.py / decommission_site.py
 
-Tag-driven site provisioning for **Infoblox Universal DDI**.
+Tag-driven site provisioning **and decommissioning** for **Infoblox Universal DDI**.
 
 Automates the full lifecycle of bringing up a new network site from
 a single command, using metadata tags on address blocks to drive IP
@@ -232,6 +232,89 @@ Provisioning complete.
 
 ---
 
+---
+
+## decommission_site.py
+
+Companion script that performs the **full reverse** of `provision_site.py` — tearing down a site that was previously provisioned.
+
+### What it does
+
+| Step | Action |
+|------|--------|
+| 1 | Resolves the configured IP space |
+| 2 | **Discovers** the site's address block (`Site=<name>`, `Status=allocated`) |
+| 3 | Resolves the DNS view |
+| 4 | **Enumerates** all subnets inside the block |
+| 5 | **Deletes** all IPAM host records in site subnets (removes DNS A/PTR automatically) |
+| 6 | **Deletes** the forward DNS authoritative zone (unless `--keep-zone`) |
+| 7 | **Deletes** all site subnets |
+| 8 | **Resets** the block — `Status=decommissioned`, `Site=unassigned`, clears `Location`/`Provisioned` |
+
+All destructive steps support `--dry-run`. An interactive confirmation prompt is shown unless `--force` is given.
+
+### Usage
+
+```
+decommission_site.py [-h] -s NAME
+                     [--final-status {decommissioned,available}]
+                     [--keep-zone]
+                     [--dns-parent ZONE] [--dns-view VIEW]
+                     [--ip-space SPACE]
+                     [--dry-run] [--force]
+                     [-c FILE] [-d | -v] [-V]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `-s`, `--site` | Short site name to decommission (required) |
+| `--final-status` | Block status after teardown: `decommissioned` (default) or `available` |
+| `--keep-zone` | Leave the site DNS zone intact |
+| `--dns-parent` | Parent DNS zone (overrides INI default) |
+| `--dns-view` | DNS view name (overrides INI default) |
+| `--ip-space` | IP space name (overrides INI default) |
+| `--dry-run` | Preview all steps without making changes |
+| `--force` | Skip the interactive confirmation prompt |
+| `-c`, `--config` | INI config file path (default: `provision_site.ini`) |
+| `-d`, `--debug` | Enable DEBUG logging |
+| `-v`, `--verbose` | Enable INFO logging |
+
+### Examples
+
+```bash
+# Preview what would be removed (no changes made)
+python3 decommission_site.py -s london --dry-run -v
+
+# Full decommission — prompts: "Type the site name to confirm"
+python3 decommission_site.py -s london -v
+
+# Non-interactive (CI/pipeline use)
+python3 decommission_site.py -s london --force -v
+
+# Reset block back to available (re-provision later)
+python3 decommission_site.py -s london --final-status available --force -v
+
+# Keep the DNS zone, only tear down IPAM resources
+python3 decommission_site.py -s london --keep-zone -v
+
+# Batch decommission all sites listed in a file
+while IFS= read -r site; do
+    python3 decommission_site.py -s "$site" --force -v
+done < sites-to-retire.txt
+```
+
+### Block status lifecycle
+
+```
+available  →  allocated  →  decommissioned
+               (provision)    (decommission)
+
+decommissioned  →  available
+                   (--final-status available, ready to re-provision)
+```
+
+---
+
 ## Extending the script
 
 ### Add more subnets
@@ -265,8 +348,9 @@ done
 
 ```
 claude_mcp_provision_site/
-├── provision_site.py          # Main script
-├── provision_site.ini.example # Configuration template
+├── provision_site.py          # Provisioning script
+├── decommission_site.py       # Decommissioning script
+├── provision_site.ini.example # Configuration template (shared by both scripts)
 ├── README.md                  # This file
 └── templates/
     ├── site-london.yaml       # Full featured example
@@ -276,6 +360,16 @@ claude_mcp_provision_site/
 ---
 
 ## Changelog
+
+| Version | Changes |
+|---------|---------|
+### decommission_site.py
+
+| Version | Changes |
+|---------|---------|
+| 1.0.0 | Initial release — full site teardown: hosts, DNS zone, subnets, block reset |
+
+### provision_site.py
 
 | Version | Changes |
 |---------|---------|
