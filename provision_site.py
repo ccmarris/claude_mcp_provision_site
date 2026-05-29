@@ -11,42 +11,51 @@
 
       1. Discover an available address block using metadata tags
          (Region, Environment, Status=available)
-      2. Carve management, user-LAN and server subnets from the block
+      2. Carve subnets from the block (standard 3-subnet plan or fully
+         customised via a YAML template)
       3. Apply per-subnet tags (Site, Purpose, DHCP, etc.)
       4. Mark the parent block as allocated and update its Site tag
       5. Create a forward DNS authoritative zone for the site
-      6. Provision a gateway host record (IPAM + DNS A/PTR)
+      6. Provision one or more host records (IPAM + DNS A/PTR)
 
     All destructive steps support --dry-run so you can preview the
     full plan before committing any changes.
 
+    Site definitions can be supplied three ways (highest to lowest
+    precedence):
+
+      1. CLI flags  (-s, -r, -e, --subnet-size, ...)
+      2. YAML template  (--template site.yaml)
+      3. INI configuration defaults  (provision_site.ini)
+
  Usage:
-    provision_site.py [-h] -s SITE -r REGION -e ENVIRONMENT
+    provision_site.py [-h] [-t TEMPLATE]
+                      [-s SITE] [-r REGION] [-e ENVIRONMENT]
                       [-l LOCATION] [--subnet-size SUBNET_SIZE]
                       [--dns-parent DNS_PARENT] [--dns-view DNS_VIEW]
                       [--ip-space IP_SPACE] [--dry-run]
                       [-c CONFIG] [-d] [-v]
 
  Examples:
-    # Dry-run: preview provisioning a London EMEA production site
-    provision_site.py -s london -r EMEA -e production -l "London, UK" --dry-run
+    # Dry-run using a YAML template
+    provision_site.py -t templates/site-london.yaml --dry-run -v
 
-    # Execute: provision the site for real
-    provision_site.py -s london -r EMEA -e production -l "London, UK"
+    # Execute using a YAML template
+    provision_site.py -t templates/site-london.yaml -v
 
-    # Override defaults
-    provision_site.py -s sydney -r APAC -e production \\
-        --dns-parent corp.example.com --dns-view internal \\
-        --subnet-size 24
+    # CLI-only (no template) with verbose output
+    provision_site.py -s london -r EMEA -e production -l "London, UK" -v
+
+    # Template + CLI override (CLI wins)
+    provision_site.py -t templates/site-london.yaml --dns-view internal
 
  Requirements:
-    Python 3.8+ with requests module
+    Python 3.8+ with requests and PyYAML modules
 
-    pip install requests
+    pip install requests pyyaml
 
  Configuration:
-    Create an INI file (default: provision_site.ini) with the
-    following structure:
+    Create an INI file (default: provision_site.ini):
 
       [UDDI]
       api_key  = <your BloxOne/Universal DDI API key>
@@ -58,6 +67,44 @@
       dns_view    = default
       owner       = network-team
       subnet_size = 24
+
+    YAML template schema (all keys optional — missing keys fall back
+    to INI defaults or CLI flags):
+
+      site:
+        name:        london
+        region:      EMEA
+        environment: production
+        location:    "London, UK"
+
+      network:
+        ip_space:    my-ip-space     # overrides INI default
+        subnet_size: 24              # default size for subnets
+
+        subnets:
+          - name:    london-mgmt
+            purpose: mgmt
+            dhcp:    false
+            cidr:    24              # per-subnet override of subnet_size
+          - name:    london-lan
+            purpose: user-lan
+            dhcp:    true
+
+      dns:
+        parent:  internal.example.com
+        view:    default
+
+      hosts:
+        - hostname: gw01
+          subnet:   london-mgmt      # name from subnets list above
+          comment:  "Site gateway"
+        - hostname: dns01
+          subnet:   london-server
+          comment:  "Site DNS server"
+
+      tags:
+        Owner:      network-team
+        CostCentre: CC-1234
 
  Author: Chris Marrison
 
@@ -92,7 +139,7 @@
 
 ------------------------------------------------------------------------
 '''
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 __author__ = 'Chris Marrison'
 __author_email__ = 'chris@infoblox.com'
 
@@ -106,6 +153,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +163,46 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SubnetDef:
+    '''
+    Definition of a single subnet to be carved from the address block.
+
+    Attributes:
+        name:    Resource name applied in IPAM (e.g. london-mgmt)
+        purpose: Tag value for the Purpose key (e.g. mgmt, user-lan)
+        dhcp:    Whether DHCP is enabled on this subnet ('true'/'false')
+        cidr:    Prefix length override; falls back to SiteConfig.subnet_size
+    '''
+    name: str
+    purpose: str
+    dhcp: str = 'false'
+    cidr: Optional[int] = None
+
+
+@dataclass
+class HostDef:
+    '''
+    Definition of a host to be provisioned in IPAM with DNS records.
+
+    Attributes:
+        hostname: Short hostname (FQDN will be hostname.dns_zone)
+        subnet:   Name of the subnet (must match a SubnetDef.name) in
+                  which to allocate the first available IP
+        comment:  Free-text description stored on the IPAM host object
+    '''
+    hostname: str
+    subnet: str
+    comment: str = ''
+
+
+@dataclass
 class SiteConfig:
     '''
     Holds all parameters needed to provision a single site.
+
+    The subnet_plan and hosts lists drive what gets created.  When no
+    YAML template is supplied the built-in three-subnet / one-gateway
+    defaults are used, preserving backwards compatibility with v1.0.0.
     '''
     site: str
     region: str
@@ -129,6 +214,9 @@ class SiteConfig:
     owner: str
     subnet_size: int
     dry_run: bool
+    extra_tags: dict = field(default_factory=dict)
+    _subnet_plan: list[SubnetDef] = field(default_factory=list)
+    _hosts: list[HostDef] = field(default_factory=list)
     date: str = field(default_factory=lambda: datetime.date.today().isoformat())
 
     @property
@@ -137,12 +225,34 @@ class SiteConfig:
         return f'site-{self.site}.{self.dns_parent}'
 
     @property
-    def subnet_plan(self) -> list[dict]:
-        '''Standard three-subnet plan carved from the address block.'''
+    def subnet_plan(self) -> list[SubnetDef]:
+        '''
+        Custom subnet plan from YAML template, or the built-in default
+        (mgmt / user-lan / server) when no template was supplied.
+        '''
+        if self._subnet_plan:
+            return self._subnet_plan
         return [
-            {'name': f'{self.site}-mgmt',   'purpose': 'mgmt',     'dhcp': 'false'},
-            {'name': f'{self.site}-lan',    'purpose': 'user-lan', 'dhcp': 'true'},
-            {'name': f'{self.site}-server', 'purpose': 'server',   'dhcp': 'false'},
+            SubnetDef(name=f'{self.site}-mgmt',   purpose='mgmt',     dhcp='false'),
+            SubnetDef(name=f'{self.site}-lan',    purpose='user-lan', dhcp='true'),
+            SubnetDef(name=f'{self.site}-server', purpose='server',   dhcp='false'),
+        ]
+
+    @property
+    def hosts(self) -> list[HostDef]:
+        '''
+        Custom host list from YAML template, or a single gateway host
+        (gw01 in the first subnet) when no template was supplied.
+        '''
+        if self._hosts:
+            return self._hosts
+        first_subnet = self.subnet_plan[0].name
+        return [
+            HostDef(
+                hostname=f'gw01',
+                subnet=first_subnet,
+                comment=f'{self.site.capitalize()} site gateway',
+            )
         ]
 
 
@@ -157,10 +267,199 @@ class ProvisionResult:
     subnets: list[dict] = field(default_factory=list)
     dns_zone_id: str = ''
     dns_zone_fqdn: str = ''
-    gateway_host_id: str = ''
-    gateway_fqdn: str = ''
-    gateway_ip: str = ''
+    hosts: list[dict] = field(default_factory=list)
     dry_run: bool = False
+
+
+# ---------------------------------------------------------------------------
+# YAML template loader
+# ---------------------------------------------------------------------------
+
+def load_yaml_template(path: str) -> dict:
+    '''
+    Load and parse a YAML site template file.
+
+    Args:
+        path: Filesystem path to the YAML template
+
+    Returns:
+        Parsed template as a plain dict
+
+    Raises:
+        SystemExit if the file cannot be opened or is not valid YAML
+    '''
+    logger.info('Loading YAML template: %s', path)
+    try:
+        with open(path, 'r') as fh:
+            data = yaml.safe_load(fh)
+    except FileNotFoundError:
+        logger.error('YAML template not found: %s', path)
+        sys.exit(1)
+    except yaml.YAMLError as exc:
+        logger.error('Invalid YAML in %s: %s', path, exc)
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        logger.error('YAML template must be a mapping (dict) at the top level: %s', path)
+        sys.exit(1)
+
+    logger.debug('Template loaded: %s', data)
+    return data
+
+
+def template_to_site_config(
+    template: dict,
+    ini_defaults: dict,
+    cli_args: argparse.Namespace,
+) -> SiteConfig:
+    '''
+    Merge a YAML template, INI defaults, and CLI arguments into a
+    SiteConfig.
+
+    Precedence (highest → lowest):
+        CLI flags  >  YAML template  >  INI defaults  >  hardcoded fallbacks
+
+    Args:
+        template:     Parsed YAML template dict (may be empty)
+        ini_defaults: Dict of key/value pairs from [DEFAULTS] in the
+                      INI configuration file
+        cli_args:     Parsed argparse Namespace from parseargs()
+
+    Returns:
+        Fully populated SiteConfig instance
+
+    Raises:
+        SystemExit if mandatory values (site, region, environment,
+        ip_space, dns_parent) cannot be resolved from any source
+    '''
+    site_sec  = template.get('site', {}) or {}
+    net_sec   = template.get('network', {}) or {}
+    dns_sec   = template.get('dns', {}) or {}
+    tags_sec  = template.get('tags', {}) or {}
+    hosts_sec = template.get('hosts', []) or []
+    subnets_sec = net_sec.get('subnets', []) or []
+
+    def resolve(cli_val, yaml_val, ini_key, fallback=''):
+        '''Return the first non-None/non-empty value in priority order.'''
+        if cli_val is not None and cli_val != '':
+            return cli_val
+        if yaml_val is not None and yaml_val != '':
+            return yaml_val
+        return ini_defaults.get(ini_key, fallback)
+
+    # --- Mandatory fields ---
+    site = resolve(
+        getattr(cli_args, 'site', None),
+        site_sec.get('name'),
+        'site',
+    )
+    region = resolve(
+        getattr(cli_args, 'region', None),
+        site_sec.get('region'),
+        'region',
+    )
+    environment = resolve(
+        getattr(cli_args, 'environment', None),
+        site_sec.get('environment'),
+        'environment',
+    )
+    ip_space = resolve(
+        getattr(cli_args, 'ip_space', None),
+        net_sec.get('ip_space'),
+        'ip_space',
+    )
+    dns_parent = resolve(
+        getattr(cli_args, 'dns_parent', None),
+        dns_sec.get('parent'),
+        'dns_parent',
+    )
+
+    errors = []
+    for label, value in [
+        ('site / --site', site),
+        ('region / site.region', region),
+        ('environment / site.environment', environment),
+        ('ip_space / network.ip_space', ip_space),
+        ('dns_parent / dns.parent', dns_parent),
+    ]:
+        if not value:
+            errors.append(label)
+    if errors:
+        logger.error(
+            'Required values missing (supply via CLI, YAML template, or INI): %s',
+            ', '.join(errors),
+        )
+        sys.exit(1)
+
+    # --- Optional fields ---
+    location = resolve(
+        getattr(cli_args, 'location', None),
+        site_sec.get('location'),
+        'location',
+        fallback=site.capitalize(),
+    )
+    dns_view = resolve(
+        getattr(cli_args, 'dns_view', None),
+        dns_sec.get('view'),
+        'dns_view',
+        fallback='default',
+    )
+    owner = resolve(
+        None,
+        tags_sec.get('Owner') or site_sec.get('owner'),
+        'owner',
+        fallback='network-team',
+    )
+    subnet_size_raw = resolve(
+        getattr(cli_args, 'subnet_size', None),
+        net_sec.get('subnet_size'),
+        'subnet_size',
+        fallback=24,
+    )
+    subnet_size = int(subnet_size_raw)
+
+    # --- Subnet plan from YAML ---
+    subnet_plan: list[SubnetDef] = []
+    for s in subnets_sec:
+        subnet_plan.append(SubnetDef(
+            name=s.get('name', f'{site}-{s.get("purpose", "net")}'),
+            purpose=s.get('purpose', 'general'),
+            dhcp=str(s.get('dhcp', False)).lower(),
+            cidr=s.get('cidr'),          # None → use subnet_size default
+        ))
+
+    # --- Host list from YAML ---
+    host_list: list[HostDef] = []
+    for h in hosts_sec:
+        if 'hostname' not in h:
+            logger.warning('Skipping host entry with no hostname: %s', h)
+            continue
+        # Default subnet is the first in the plan (mgmt)
+        default_subnet = subnet_plan[0].name if subnet_plan else f'{site}-mgmt'
+        host_list.append(HostDef(
+            hostname=h['hostname'],
+            subnet=h.get('subnet', default_subnet),
+            comment=h.get('comment', ''),
+        ))
+
+    # Extra tags from the YAML [tags] section (Owner already extracted above)
+    extra_tags = {k: str(v) for k, v in tags_sec.items()}
+
+    return SiteConfig(
+        site=site.lower(),
+        region=region,
+        environment=environment,
+        location=location,
+        ip_space=ip_space,
+        dns_parent=dns_parent,
+        dns_view=dns_view,
+        owner=owner,
+        subnet_size=subnet_size,
+        dry_run=getattr(cli_args, 'dry_run', False),
+        extra_tags=extra_tags,
+        _subnet_plan=subnet_plan,
+        _hosts=host_list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,13 +582,13 @@ class SiteProvisioner:
 
     Steps
     -----
-    1. resolve_ip_space()        - look up IP space ID from name
-    2. find_available_block()    - tag-based discovery of address block
-    3. resolve_dns_view()        - look up DNS view ID from name
-    4. create_subnets()          - carve /N subnets from the block
-    5. update_block_status()     - mark block as allocated
-    6. create_dns_zone()         - create forward authoritative zone
-    7. provision_gateway()       - IPAM host + DNS A/PTR for gw01
+    1. resolve_ip_space()     - look up IP space ID from name
+    2. find_available_block() - tag-based discovery of address block
+    3. resolve_dns_view()     - look up DNS view ID from name
+    4. create_subnets()       - carve subnets per plan (standard or YAML)
+    5. update_block_status()  - mark block as allocated
+    6. create_dns_zone()      - create forward authoritative zone
+    7. provision_hosts()      - IPAM host + DNS A/PTR for each host in plan
     '''
 
     def __init__(self, client: UDDIClient, cfg: SiteConfig) -> None:
@@ -405,64 +704,70 @@ class SiteProvisioner:
     # Step 4: Carve subnets
     # ------------------------------------------------------------------
 
-    def create_subnets(self, block: dict) -> list[dict]:
+    def create_subnets(self, block: dict) -> dict[str, dict]:
         '''
-        Carve one /subnet_size subnet per role (mgmt, lan, server)
-        from the given address block, assigning addresses sequentially
-        from the start of the block.
+        Carve one subnet per entry in cfg.subnet_plan from the given
+        address block, assigning addresses sequentially from the start
+        of the block.
+
+        Each subnet uses its own cidr if specified in the plan, otherwise
+        falls back to cfg.subnet_size.
 
         Each subnet receives tags:
             Site, Region, Environment, Owner, Purpose, DHCP
+            plus any extra_tags defined in the YAML template.
 
         Args:
             block: Address block resource dict from find_available_block()
 
         Returns:
-            List of created subnet resource dicts (or dry-run plan dicts)
+            Dict mapping subnet name → subnet resource dict (or dry-run
+            plan dict), allowing hosts to look up subnets by name.
         '''
         block_addr = block['address']  # e.g. '10.20.0.0'
         base_octets = block_addr.split('.')
-        created = []
+        created: dict[str, dict] = {}
 
-        for idx, role in enumerate(self.cfg.subnet_plan):
-            # Increment third octet for each subnet in the /16 block
+        for idx, sdef in enumerate(self.cfg.subnet_plan):
+            cidr = sdef.cidr if sdef.cidr is not None else self.cfg.subnet_size
+            # Assign sequentially from third octet within the block
             subnet_addr = '.'.join(base_octets[:2] + [str(idx)] + ['0'])
-            cidr = f'{subnet_addr}/{self.cfg.subnet_size}'
             tags = {
                 'Site':        self.cfg.site,
                 'Region':      self.cfg.region,
                 'Environment': self.cfg.environment,
                 'Owner':       self.cfg.owner,
-                'Purpose':     role['purpose'],
-                'DHCP':        role['dhcp'],
+                'Purpose':     sdef.purpose,
+                'DHCP':        sdef.dhcp,
+                **self.cfg.extra_tags,
             }
             logger.info(
-                '%sCreating subnet %s  name=%s  purpose=%s',
+                '%sCreating subnet %s/%s  name=%s  purpose=%s',
                 '[DRY-RUN] ' if self.cfg.dry_run else '',
-                cidr, role['name'], role['purpose'],
+                subnet_addr, cidr, sdef.name, sdef.purpose,
             )
             if self.cfg.dry_run:
-                created.append({
+                created[sdef.name] = {
                     'dry_run': True,
                     'address': subnet_addr,
-                    'cidr': self.cfg.subnet_size,
-                    'name': role['name'],
+                    'cidr': cidr,
+                    'name': sdef.name,
                     'tags': tags,
-                })
+                }
                 continue
 
             body = {
-                'address':  subnet_addr,
-                'cidr':     self.cfg.subnet_size,
-                'name':     role['name'],
-                'space':    self._space_id,
-                'comment':  f'{self.cfg.site.capitalize()} site - {role["purpose"]} network',
-                'tags':     tags,
+                'address': subnet_addr,
+                'cidr':    cidr,
+                'name':    sdef.name,
+                'space':   self._space_id,
+                'comment': f'{self.cfg.site.capitalize()} site - {sdef.purpose} network',
+                'tags':    tags,
             }
             result = self.client.post('/ipam/subnet', body)
             subnet = result.get('result', {})
             logger.info('  Created subnet id=%s', subnet.get('id'))
-            created.append(subnet)
+            created[sdef.name] = subnet
 
         return created
 
@@ -484,6 +789,7 @@ class SiteProvisioner:
         existing_tags = block.get('tags', {})
         updated_tags = {
             **existing_tags,
+            **self.cfg.extra_tags,
             'Status':    'allocated',
             'Site':       self.cfg.site,
             'Location':   self.cfg.location,
@@ -537,63 +843,88 @@ class SiteProvisioner:
         return zone
 
     # ------------------------------------------------------------------
-    # Step 7: Provision gateway host
+    # Step 7: Provision hosts
     # ------------------------------------------------------------------
 
-    def provision_gateway(self, subnets: list[dict]) -> dict:
+    def provision_hosts(self, subnets: dict[str, dict]) -> list[dict]:
         '''
-        Create an IPAM host for the site gateway (gw01) in the
-        management subnet, with auto-generated DNS A and PTR records.
+        Provision each host defined in cfg.hosts, allocating the first
+        available IP in the named subnet and creating DNS A/PTR records.
 
-        The gateway is assigned the first usable address in the
-        management subnet (base_address + 1).
+        The host IP is derived as subnet_base + 1.  For multiple hosts
+        in the same subnet the offset increments automatically.
 
         Args:
-            subnets: List of subnet resource dicts from create_subnets()
+            subnets: Dict of subnet_name → subnet resource dict returned
+                     by create_subnets()
 
         Returns:
-            Created IPAM host resource dict (or dry-run plan dict)
+            List of created IPAM host resource dicts (or dry-run plan
+            dicts), one per host definition.
         '''
-        # Management subnet is always the first in the plan
-        mgmt_subnet = subnets[0]
-        if self.cfg.dry_run:
-            mgmt_addr = mgmt_subnet.get('address', '<mgmt-subnet-base>')
-        else:
-            mgmt_addr = mgmt_subnet.get('address', '')
+        # Track per-subnet offset so multiple hosts in the same subnet
+        # get sequential IPs (.1, .2, ...)
+        subnet_offsets: dict[str, int] = {}
+        results = []
 
-        # First usable host = base + 1 (e.g. 10.20.0.0 -> 10.20.0.1)
-        octets = mgmt_addr.split('.')
-        octets[-1] = str(int(octets[-1]) + 1)
-        gw_ip = '.'.join(octets)
+        for hdef in self.cfg.hosts:
+            subnet = subnets.get(hdef.subnet)
+            if subnet is None:
+                logger.warning(
+                    'Host %s references unknown subnet "%s" — skipping',
+                    hdef.hostname, hdef.subnet,
+                )
+                continue
 
-        hostname = f'gw01.{self.cfg.dns_zone}'
-        logger.info(
-            '%sProvisioning gateway host: %s -> %s',
-            '[DRY-RUN] ' if self.cfg.dry_run else '',
-            hostname, gw_ip,
-        )
-        if self.cfg.dry_run:
-            return {
-                'dry_run': True,
-                'fqdn': hostname,
-                'ip':   gw_ip,
+            if self.cfg.dry_run:
+                base_addr = subnet.get('address', '<subnet-base>')
+            else:
+                base_addr = subnet.get('address', '')
+
+            offset = subnet_offsets.get(hdef.subnet, 1)
+            subnet_offsets[hdef.subnet] = offset + 1
+
+            octets = base_addr.split('.')
+            octets[-1] = str(int(octets[-1]) + offset)
+            host_ip = '.'.join(octets)
+
+            fqdn = f'{hdef.hostname}.{self.cfg.dns_zone}'
+            logger.info(
+                '%sProvisioning host: %s -> %s  (subnet=%s)',
+                '[DRY-RUN] ' if self.cfg.dry_run else '',
+                fqdn, host_ip, hdef.subnet,
+            )
+
+            if self.cfg.dry_run:
+                results.append({
+                    'dry_run':  True,
+                    'fqdn':     fqdn,
+                    'ip':       host_ip,
+                    'subnet':   hdef.subnet,
+                    'hostname': hdef.hostname,
+                })
+                continue
+
+            body = {
+                'name':    fqdn,
+                'comment': hdef.comment or f'{self.cfg.site.capitalize()} - {hdef.hostname}',
+                'addresses': [{
+                    'address':     host_ip,
+                    'space':       self._space_id,
+                    'enable_dhcp': False,
+                }],
+                'auto_generate_records': True,
+                'dns_zone': self._view_id,
             }
+            result = self.client.post('/ipam/host', body)
+            host = result.get('result', {})
+            host['fqdn'] = fqdn
+            host['ip'] = host_ip
+            host['hostname'] = hdef.hostname
+            logger.info('  Created host id=%s', host.get('id'))
+            results.append(host)
 
-        body = {
-            'name':    hostname,
-            'comment': f'{self.cfg.site.capitalize()} site gateway',
-            'addresses': [{
-                'address':     gw_ip,
-                'space':       self._space_id,
-                'enable_dhcp': False,
-            }],
-            'auto_generate_records': True,
-            'dns_zone': self._view_id,
-        }
-        result = self.client.post('/ipam/host', body)
-        host = result.get('result', {})
-        logger.info('  Created host id=%s', host.get('id'))
-        return host
+        return results
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -620,7 +951,7 @@ class SiteProvisioner:
         # Step 3: Resolve DNS view
         self.resolve_dns_view()
 
-        # Step 4: Carve subnets
+        # Step 4: Carve subnets (returns dict of name -> resource)
         subnets = self.create_subnets(block)
         result.subnets = [
             {
@@ -628,7 +959,7 @@ class SiteProvisioner:
                 'name':    s.get('name', ''),
                 'id':      s.get('id', '(dry-run)'),
             }
-            for s in subnets
+            for s in subnets.values()
         ]
 
         # Step 5: Update block status
@@ -639,11 +970,17 @@ class SiteProvisioner:
         result.dns_zone_id = zone.get('id', '(dry-run)')
         result.dns_zone_fqdn = zone.get('fqdn', self.cfg.dns_zone)
 
-        # Step 7: Provision gateway host
-        gw = self.provision_gateway(subnets)
-        result.gateway_host_id = gw.get('id', '(dry-run)')
-        result.gateway_fqdn = gw.get('fqdn', f'gw01.{self.cfg.dns_zone}')
-        result.gateway_ip = gw.get('ip', '')
+        # Step 7: Provision hosts
+        hosts = self.provision_hosts(subnets)
+        result.hosts = [
+            {
+                'fqdn':     h.get('fqdn', ''),
+                'ip':       h.get('ip', ''),
+                'hostname': h.get('hostname', ''),
+                'id':       h.get('id', '(dry-run)'),
+            }
+            for h in hosts
+        ]
 
         return result
 
@@ -668,10 +1005,13 @@ def print_result(result: ProvisionResult) -> None:
     print()
     print('  Subnets:')
     for s in result.subnets:
-        print(f'    {s["address"]:<20}  {s["name"]:<25}  id={s["id"]}')
+        print(f'    {s["address"]:<22}  {s["name"]:<28}  id={s["id"]}')
     print()
     print(f'  DNS zone      : {result.dns_zone_fqdn}  id={result.dns_zone_id}')
-    print(f'  Gateway host  : {result.gateway_fqdn} -> {result.gateway_ip}')
+    print()
+    print('  Hosts:')
+    for h in result.hosts:
+        print(f'    {h["fqdn"]:<45}  -> {h["ip"]:<16}  id={h["id"]}')
     print('=' * 60)
     if result.dry_run:
         print('DRY-RUN complete. Rerun without --dry-run to execute.')
@@ -718,7 +1058,10 @@ def read_config(config_file: str) -> configparser.ConfigParser:
     required = [('UDDI', 'api_key'), ('UDDI', 'url')]
     for section, key in required:
         if not cfg.has_option(section, key):
-            logger.error('Missing required config [%s] %s in %s', section, key, config_file)
+            logger.error(
+                'Missing required config [%s] %s in %s',
+                section, key, config_file,
+            )
             sys.exit(1)
 
     return cfg
@@ -756,9 +1099,8 @@ def parseargs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Tag-driven site provisioning for Infoblox Universal DDI',
         epilog=(
-            'The script discovers an available address block using Region, '
-            'Environment, and Status tags, then carves subnets, creates a '
-            'DNS zone, and provisions a gateway host — all in one step.'
+            'Site parameters are resolved from (highest to lowest priority): '
+            'CLI flags > YAML template (--template) > INI file defaults.'
         ),
     )
 
@@ -769,31 +1111,42 @@ def parseargs() -> argparse.Namespace:
         version=f'%(prog)s {__version__}',
     )
 
-    # Required site parameters
-    site_grp = parser.add_argument_group('site parameters')
+    # YAML template
+    parser.add_argument(
+        '-t', '--template',
+        default=None,
+        metavar='FILE',
+        help='Path to a YAML site definition template',
+    )
+
+    # Site parameters (all optional when a template is provided)
+    site_grp = parser.add_argument_group(
+        'site parameters',
+        'Override or supplement values from the YAML template',
+    )
     site_grp.add_argument(
         '-s', '--site',
-        required=True,
+        default=None,
         metavar='NAME',
         help='Short site name used in subnet names and DNS zone (e.g. london)',
     )
     site_grp.add_argument(
         '-r', '--region',
-        required=True,
+        default=None,
         metavar='REGION',
         help='Geographic region tag to match on address block (e.g. EMEA)',
     )
     site_grp.add_argument(
         '-e', '--environment',
-        required=True,
+        default=None,
         metavar='ENV',
         help='Environment tag to match on address block (e.g. production)',
     )
     site_grp.add_argument(
         '-l', '--location',
-        default='',
+        default=None,
         metavar='LOCATION',
-        help='Human-readable location applied to the block after allocation (e.g. "London, UK")',
+        help='Human-readable location applied to the block (e.g. "London, UK")',
     )
 
     # Optional overrides
@@ -803,25 +1156,25 @@ def parseargs() -> argparse.Namespace:
         type=int,
         default=None,
         metavar='CIDR',
-        help='Subnet prefix length to carve (default from config, typically 24)',
+        help='Default subnet prefix length to carve (overrides template/config)',
     )
     opt_grp.add_argument(
         '--dns-parent',
         default=None,
         metavar='ZONE',
-        help='Parent DNS zone (default from config, e.g. internal.example.com)',
+        help='Parent DNS zone (overrides template/config)',
     )
     opt_grp.add_argument(
         '--dns-view',
         default=None,
         metavar='VIEW',
-        help='DNS view name (default from config)',
+        help='DNS view name (overrides template/config)',
     )
     opt_grp.add_argument(
         '--ip-space',
         default=None,
         metavar='SPACE',
-        help='IP space name (default from config)',
+        help='IP space name (overrides template/config)',
     )
 
     # Execution control
@@ -864,46 +1217,32 @@ def main() -> None:
     '''
     Main entry point.
 
-    Reads configuration, builds SiteConfig, runs the provisioner,
-    and prints a summary.
+    Reads configuration and optional YAML template, builds SiteConfig,
+    runs the provisioner, and prints a summary.
     '''
     args = parseargs()
     setup_logging(debug=args.debug, verbose=args.verbose)
 
     logger.debug('Arguments: %s', args)
 
-    # Load config file
+    # Load INI config
     cfg_file = read_config(args.config)
+    ini_defaults = dict(cfg_file['DEFAULTS']) if cfg_file.has_section('DEFAULTS') else {}
 
-    # Build SiteConfig — CLI args override config file defaults
-    defaults = cfg_file['DEFAULTS'] if cfg_file.has_section('DEFAULTS') else {}
+    # Load YAML template (empty dict if none supplied)
+    template: dict = {}
+    if args.template:
+        template = load_yaml_template(args.template)
 
-    site_cfg = SiteConfig(
-        site=args.site.lower(),
-        region=args.region,
-        environment=args.environment,
-        location=args.location or f'{args.site.capitalize()}',
-        ip_space=args.ip_space or defaults.get('ip_space', ''),
-        dns_parent=args.dns_parent or defaults.get('dns_parent', ''),
-        dns_view=args.dns_view or defaults.get('dns_view', 'default'),
-        owner=defaults.get('owner', 'network-team'),
-        subnet_size=args.subnet_size or int(defaults.get('subnet_size', 24)),
-        dry_run=args.dry_run,
-    )
-
-    if not site_cfg.ip_space:
-        logger.error('ip_space must be set via --ip-space or [DEFAULTS] ip_space in config')
-        sys.exit(1)
-    if not site_cfg.dns_parent:
-        logger.error('dns_parent must be set via --dns-parent or [DEFAULTS] dns_parent in config')
-        sys.exit(1)
+    # Merge template + INI defaults + CLI args into SiteConfig
+    site_cfg = template_to_site_config(template, ini_defaults, args)
 
     logger.info('Site config: %s', site_cfg)
 
-    if site_cfg.dry_run:
-        print(f'\n[DRY-RUN] Previewing site provisioning for: {site_cfg.site}')
-    else:
-        print(f'\nProvisioning site: {site_cfg.site}')
+    mode_label = '[DRY-RUN] ' if site_cfg.dry_run else ''
+    print(f'\n{mode_label}Provisioning site: {site_cfg.site}')
+    if args.template:
+        print(f'  Template: {args.template}')
 
     # Initialise API client
     client = UDDIClient(

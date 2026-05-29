@@ -1,0 +1,12 @@
+# ---------------------------------------------------------------------------
+# Minimal site template — only mandatory fields
+# ---------------------------------------------------------------------------
+# ip_space, dns.parent, dns.view, subnet_size, and owner all fall back
+# to the INI configuration file [DEFAULTS] section.
+# ---------------------------------------------------------------------------
+
+site:
+  name:        sydney
+  region:      APAC
+  environment: production
+  location:    "Sydney, AU"

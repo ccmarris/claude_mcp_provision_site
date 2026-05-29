@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# Site template: London (EMEA Production)
+# ---------------------------------------------------------------------------
+# All sections are optional — any missing values fall back to the INI
+# configuration file defaults, then to hardcoded fallbacks.
+# CLI flags always take highest precedence and override values here.
+# ---------------------------------------------------------------------------
+
+site:
+  name:        london
+  region:      EMEA
+  environment: production
+  location:    "London, UK"
+
+network:
+  # IP space to provision into (overrides INI default if set)
+  ip_space:    marrison-ip-space
+
+  # Default subnet prefix length — overridden per subnet via 'cidr' key
+  subnet_size: 24
+
+  subnets:
+    - name:    london-mgmt
+      purpose: mgmt
+      dhcp:    false
+      cidr:    24
+
+    - name:    london-lan
+      purpose: user-lan
+      dhcp:    true
+      cidr:    24
+
+    - name:    london-server
+      purpose: server
+      dhcp:    false
+      cidr:    24
+
+    - name:    london-dmz
+      purpose: dmz
+      dhcp:    false
+      cidr:    24
+
+dns:
+  # Parent zone under which the site zone is created:
+  #   site-london.<parent>
+  parent: marrison.internal
+  view:   marrison-b1se-lab1
+
+hosts:
+  # Each host is provisioned in the named subnet (base+N IP, DNS A+PTR)
+  - hostname: gw01
+    subnet:   london-mgmt
+    comment:  "London site gateway"
+
+  - hostname: dns01
+    subnet:   london-server
+    comment:  "London site DNS server"
+
+  - hostname: mon01
+    subnet:   london-mgmt
+    comment:  "London site monitoring host"
+
+# Extra tags applied to the address block and all subnets
+tags:
+  Owner:      marrison
+  CostCentre: CC-EMEA-001
